@@ -3,6 +3,7 @@ CLAUDE.md
 findings.md
 .claude/
 
+results/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -10,9 +11,11 @@ __pycache__/
 
 # C extensions
 *.so
+#diagnostic results and plots
 *.npz
 *.png
 *.pdf
+*.h5
 # Distribution / packaging
 .Python
 build/
