@@ -85,7 +85,7 @@ def main(argv=None):
     print(f"\nLoading visibilities from {args.data_dir}, obs={args.obs}")
     fmt = None
     if args.format:
-        from casm_io.correlator.reader import load_format
+        from casm_io.correlator.formats import load_format
         fmt = load_format(args.format)
 
     loader = VisibilityLoader(mapping)
@@ -167,7 +167,7 @@ def main(argv=None):
         os.makedirs(os.path.dirname(os.path.abspath(args.plots)), exist_ok=True)
         print(f"\nGenerating diagnostic plots: {args.plots}")
         DiagnosticPlotter()(
-            pdf_path=args.plots,
+            output_path=args.plots,
             freqs_mhz=vis_fs.freq_mhz,
             svd_result=svd_result,
             threshold=args.threshold,
