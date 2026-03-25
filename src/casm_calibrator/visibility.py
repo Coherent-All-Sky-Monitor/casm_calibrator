@@ -58,7 +58,17 @@ class VisibilityLoader:
         active_rows = [id_to_row[int(a)] for a in self._ant_ids]
         self._positions = self._positions[active_rows]
 
-    def load(self, data_dir, obs_id, fmt=None, nfiles=None) -> VisibilityMatrix:
+    def load(
+        self,
+        data_dir,
+        obs_id,
+        fmt=None,
+        nfiles=None,
+        skip_nfiles=0,
+        time_start=None,
+        time_end=None,
+        time_tz="UTC",
+    ) -> VisibilityMatrix:
         """Load visibilities and reshape to NxN matrix.
 
         Parameters
@@ -71,6 +81,14 @@ class VisibilityLoader:
             Format config. None for auto-detect.
         nfiles : int, optional
             Number of files to read.
+        skip_nfiles : int
+            Number of files to skip before reading (requires nfiles).
+        time_start : str | None
+            Start time for data selection (ISO format).
+        time_end : str | None
+            End time for data selection (ISO format).
+        time_tz : str
+            Timezone for time_start/time_end (default: UTC).
 
         Returns
         -------
@@ -79,6 +97,10 @@ class VisibilityLoader:
         reader = VisibilityReader(data_dir, obs_id, fmt=fmt)
         data = reader.read(
             nfiles=nfiles,
+            skip_nfiles=skip_nfiles,
+            time_start=time_start,
+            time_end=time_end,
+            time_tz=time_tz,
             freq_order="ascending",
             verbose=True,
         )

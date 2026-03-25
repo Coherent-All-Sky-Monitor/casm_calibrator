@@ -125,3 +125,92 @@ class TestPerBlockSVD:
 
         # Interpolated block should still have weights (flags True)
         assert np.all(result.flags[16:24])  # filled via interpolation
+
+
+class TestInverseVarianceWeighting:
+    """Tests for inverse-variance amplitude weighting."""
+
+    def test_noisy_antenna_downweighted(self, n_ant=4, n_chan=32):
+        """Antenna with higher auto-power gets lower amplitude weight."""
+        rng = np.random.default_rng(99)
+
+        # Create rank-1 vis with uniform gains
+        phases = rng.uniform(-np.pi, np.pi, (n_ant, n_chan))
+        phases[0, :] = 0.0
+        true_gains = np.exp(1j * phases)
+
+        vis_avg = np.zeros((n_chan, n_ant, n_ant), dtype=np.complex128)
+        for f in range(n_chan):
+            g = true_gains[:, f]
+            vis_avg[f] = np.outer(g, np.conj(g))
+
+        # Make antenna 0 have 10x auto-power (noisy)
+        for f in range(n_chan):
+            vis_avg[f, 0, 0] *= 10.0
+
+        config = SVDConfig(
+            threshold=2.0, ref_ant_idx=0, svd_mode=SVDMode.PHASE_ONLY,
+            amp_weighting="inverse-variance",
+        )
+        result = SVDCalibrator(config).calibrate(vis_avg)
+
+        assert result.amp_weights is not None
+        # Noisy antenna 0 should have lower weight than quiet antennas
+        mean_amp_ant0 = np.mean(result.amp_weights[0, result.flags])
+        mean_amp_ant1 = np.mean(result.amp_weights[1, result.flags])
+        assert mean_amp_ant0 < mean_amp_ant1, (
+            f"Noisy antenna should be downweighted: {mean_amp_ant0:.4f} >= {mean_amp_ant1:.4f}"
+        )
+        # Specifically, ant0 has 10x power, so weight ≈ 0.1
+        assert mean_amp_ant0 < 0.15, f"Expected ~0.1, got {mean_amp_ant0:.4f}"
+
+    def test_phases_preserved(self, n_ant=4, n_chan=32):
+        """Inverse-variance weighting preserves SVD phase structure."""
+        rng = np.random.default_rng(42)
+        phases = rng.uniform(-np.pi, np.pi, (n_ant, n_chan))
+        phases[0, :] = 0.0
+        true_gains = np.exp(1j * phases)
+
+        vis_avg = np.zeros((n_chan, n_ant, n_ant), dtype=np.complex128)
+        for f in range(n_chan):
+            g = true_gains[:, f]
+            vis_avg[f] = np.outer(g, np.conj(g))
+            vis_avg[f, 0, 0] *= 5.0  # unequal auto-power
+
+        # Phase-only result
+        config_phase = SVDConfig(threshold=2.0, ref_ant_idx=0, svd_mode=SVDMode.PHASE_ONLY)
+        result_phase = SVDCalibrator(config_phase).calibrate(vis_avg)
+
+        # Inverse-variance result
+        config_iv = SVDConfig(
+            threshold=2.0, ref_ant_idx=0, svd_mode=SVDMode.PHASE_ONLY,
+            amp_weighting="inverse-variance",
+        )
+        result_iv = SVDCalibrator(config_iv).calibrate(vis_avg)
+
+        # Phases should match (modulo amplitude)
+        for ch in range(n_chan):
+            if result_phase.flags[ch] and result_iv.flags[ch]:
+                phase_diff = np.angle(result_iv.gains[:, ch]) - np.angle(result_phase.gains[:, ch])
+                phase_diff = np.abs(np.mod(phase_diff + np.pi, 2 * np.pi) - np.pi)
+                assert np.all(phase_diff < 0.01), (
+                    f"Phase mismatch at channel {ch}: {phase_diff}"
+                )
+
+    def test_default_no_amp_weights(self, n_ant=4, n_chan=16):
+        """Default (no amp weighting) should have amp_weights=None."""
+        rng = np.random.default_rng(7)
+        phases = rng.uniform(-np.pi, np.pi, (n_ant, n_chan))
+        phases[0, :] = 0.0
+        true_gains = np.exp(1j * phases)
+
+        vis_avg = np.zeros((n_chan, n_ant, n_ant), dtype=np.complex128)
+        for f in range(n_chan):
+            g = true_gains[:, f]
+            vis_avg[f] = np.outer(g, np.conj(g))
+
+        config = SVDConfig(threshold=2.0, ref_ant_idx=0, svd_mode=SVDMode.PHASE_ONLY)
+        result = SVDCalibrator(config).calibrate(vis_avg)
+        assert result.amp_weights is None
+        # Gains should be unit amplitude
+        assert np.allclose(np.abs(result.gains[:, result.flags]), 1.0, atol=1e-10)

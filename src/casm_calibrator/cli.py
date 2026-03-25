@@ -61,7 +61,21 @@ def main(argv=None):
         help="RFI range to flag (repeatable)",
     )
     parser.add_argument("--nfiles", type=int, default=None, help="Number of files to read")
+    parser.add_argument("--skip-nfiles", type=int, default=0,
+                        help="Number of files to skip before reading (requires --nfiles)")
+    parser.add_argument("--time-start", default=None,
+                        help="Start time for data selection (ISO format)")
+    parser.add_argument("--time-end", default=None,
+                        help="End time for data selection (ISO format)")
+    parser.add_argument("--time-tz", default="UTC",
+                        help="Timezone for --time-start/--time-end (default: UTC)")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--amp-weighting",
+        default="none",
+        choices=["none", "inverse-variance"],
+        help="Amplitude weighting: 'inverse-variance' downweights noisy antennas (default: none).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -89,7 +103,14 @@ def main(argv=None):
         fmt = load_format(args.format)
 
     loader = VisibilityLoader(mapping)
-    vis_matrix = loader.load(args.data_dir, args.obs, fmt=fmt, nfiles=args.nfiles)
+    vis_matrix = loader.load(
+        args.data_dir, args.obs, fmt=fmt,
+        nfiles=args.nfiles,
+        skip_nfiles=args.skip_nfiles,
+        time_start=args.time_start,
+        time_end=args.time_end,
+        time_tz=args.time_tz,
+    )
     print(f"  vis shape: {vis_matrix.vis.shape}")
     print(f"  freq range: {vis_matrix.freq_mhz[0]:.2f} - {vis_matrix.freq_mhz[-1]:.2f} MHz")
 
@@ -134,9 +155,10 @@ def main(argv=None):
         svd_mode=svd_mode,
         block_size=args.block_size,
         fill_mode=args.fill_mode,
+        amp_weighting=args.amp_weighting,
     )
     print(f"\nRunning SVD (mode={args.svd_mode}, threshold={args.threshold}, "
-          f"block_size={args.block_size})...")
+          f"block_size={args.block_size}, amp_weighting={args.amp_weighting})...")
     calibrator = SVDCalibrator(config)
     svd_result = calibrator.calibrate(vis_avg)
 

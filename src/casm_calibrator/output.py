@@ -80,4 +80,8 @@ class CalibrationWeightsWriter:
                 if key in svd_result.block_metadata:
                     save_dict[key] = svd_result.block_metadata[key]
 
+        # Add amplitude weights if present (inverse-variance weighting)
+        if svd_result.amp_weights is not None:
+            save_dict["amp_weights"] = svd_result.amp_weights.astype(np.float32)
+
         np.savez_compressed(path, **save_dict)

@@ -37,6 +37,7 @@ class SVDConfig:
     svd_mode: SVDMode = SVDMode.PHASE_ONLY
     block_size: int = 1
     fill_mode: str = "interpolate"
+    amp_weighting: str = "none"
 
 
 @dataclass
@@ -65,6 +66,7 @@ class SVDResult:
     rank1_ratios: np.ndarray
     singular_values: np.ndarray
     block_metadata: dict = field(default_factory=dict)
+    amp_weights: np.ndarray | None = None
 
 
 class SVDCalibrator:
@@ -92,8 +94,63 @@ class SVDCalibrator:
         SVDResult
         """
         if self.config.block_size > 1:
-            return self._per_block_svd(vis_avg)
-        return self._per_channel_svd(vis_avg)
+            result = self._per_block_svd(vis_avg)
+        else:
+            result = self._per_channel_svd(vis_avg)
+
+        if self.config.amp_weighting == "inverse-variance":
+            result = self._apply_inverse_variance(result, vis_avg)
+
+        return result
+
+    def _apply_inverse_variance(
+        self, result: SVDResult, vis_avg: np.ndarray
+    ) -> SVDResult:
+        """Apply inverse-variance amplitude weighting from auto-power.
+
+        Downweights noisy antennas: w_i proportional to 1/P_auto_i,
+        normalized so the quietest antenna has amplitude 1.0 per channel.
+
+        Parameters
+        ----------
+        result : SVDResult
+            Phase-only SVD result to augment with amplitude.
+        vis_avg : ndarray, shape (n_chan, n_ant, n_ant)
+            Time-averaged visibility matrix (auto-power on diagonal).
+
+        Returns
+        -------
+        SVDResult
+            Updated result with amplitude-weighted gains/weights.
+        """
+        n_chan, n_ant, _ = vis_avg.shape
+
+        # Auto-power per antenna per channel: P[i, f] = Re(V[f, i, i])
+        auto_power = np.array([
+            np.real(vis_avg[:, i, i]) for i in range(n_ant)
+        ])  # (n_ant, n_chan)
+
+        # Inverse power, guard against zeros
+        inv_power = np.where(auto_power > 0, 1.0 / auto_power, 0.0)
+
+        # Normalize per channel: quietest antenna (max 1/P) gets amplitude 1.0
+        max_inv = np.max(inv_power, axis=0, keepdims=True)
+        amp_weights = np.where(max_inv > 0, inv_power / max_inv, 0.0)
+
+        # Apply to gains and weights (only on good channels)
+        gains = result.gains.copy()
+        gains[:, result.flags] *= amp_weights[:, result.flags]
+        weights = np.conj(gains)
+
+        return SVDResult(
+            gains=gains,
+            weights=weights,
+            flags=result.flags,
+            rank1_ratios=result.rank1_ratios,
+            singular_values=result.singular_values,
+            block_metadata=result.block_metadata,
+            amp_weights=amp_weights.astype(np.float32),
+        )
 
     def _per_channel_svd(self, vis_avg: np.ndarray) -> SVDResult:
         """Per-channel SVD calibration."""

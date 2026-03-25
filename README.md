@@ -20,7 +20,7 @@ pip install -e ".[dev]"
 # Basic run — sun transit, per-channel SVD, phase-only mode
 casm-svd-calibrate \
   --data-dir /mnt/nvme3/data/casm/visibilities_64ant/ \
-  --obs "2026-03-10-14:05:53" \
+  --obs "2026-03-20-05:55:45" \
   --source sun \
   --output cal_weights.npz \
   --plots diagnostics.pdf
@@ -28,7 +28,7 @@ casm-svd-calibrate \
 # Block SVD (32 channels per block) with lower threshold
 casm-svd-calibrate \
   --data-dir /mnt/nvme3/data/casm/visibilities_64ant/ \
-  --obs "2026-03-10-14:05:53" \
+  --obs "2026-03-20-05:55:45" \
   --source sun \
   --output cal_weights.npz \
   --plots diagnostics.pdf \
@@ -38,7 +38,7 @@ casm-svd-calibrate \
 # With RFI masking
 casm-svd-calibrate \
   --data-dir /mnt/nvme3/data/casm/visibilities_64ant/ \
-  --obs "2026-03-10-14:05:53" \
+  --obs "2026-03-20-05:55:45" \
   --source sun \
   --output cal_weights.npz \
   --rfi-mask-range 375 390 \
@@ -47,10 +47,10 @@ casm-svd-calibrate \
 # Cas A calibration with custom layout and reference antenna
 casm-svd-calibrate \
   --data-dir /mnt/nvme3/data/casm/visibilities_64ant/ \
-  --obs "2026-03-10-14:05:53" \
+  --obs "2026-03-20-05:55:45" \
   --source cas_a \
-  --layout ~/software/dev/antenna_layouts/antenna_layout_current.csv \
-  --ref-ant 5 \
+  --layout ~/software/dev/antenna_layouts/antenna_layout_mar21.csv \
+  --ref-ant 3 \
   --svd-mode cross-only \
   --output cas_a_weights.npz
 ```
@@ -69,8 +69,8 @@ from casm_vis_analysis.sources import find_transit_window
 import numpy as np
 
 # Load data
-mapping = AntennaMapping.load("antenna_layout_current.csv")
-vis = VisibilityLoader(mapping).load("/data/visibilities_64ant", "2026-03-10-14:05:53")
+mapping = AntennaMapping.load("antenna_layout_mar21.csv")
+vis = VisibilityLoader(mapping).load("/data/visibilities_64ant", "2026-03-20-05:55:45")
 print(vis.vis.shape)  # (T, 3072, 16, 16)
 
 # Trim to transit
@@ -87,14 +87,14 @@ vis_fs = FringeStopMatrix()(vis, "sun")
 vis_avg = np.mean(vis_fs.vis, axis=0)  # (F, n_ant, n_ant)
 
 # SVD calibration
-config = SVDConfig(threshold=2.0, ref_ant_idx=4, svd_mode=SVDMode.PHASE_ONLY)
+config = SVDConfig(threshold=2.0, ref_ant_idx=2, svd_mode=SVDMode.PHASE_ONLY)
 result = SVDCalibrator(config).calibrate(vis_avg)
 print(f"{np.sum(result.flags)}/{len(result.flags)} channels pass")
 
 # Write output (compatible with bf_weights_generator.load_calibration_weights)
 CalibrationWeightsWriter().write(
     "cal_weights.npz", result, vis.freq_mhz, vis.ant_ids,
-    ref_ant_id=5, source="sun",
+    ref_ant_id=3, source="sun",
 )
 ```
 
@@ -121,7 +121,7 @@ casm-svd-calibrate --help
 | `--obs` | required | Observation base string (UTC timestamp) |
 | `--source` | required | Source: sun, cas_a, tau_a, cyg_a |
 | `--output` | required | Output NPZ path |
-| `--layout` | `~/software/dev/antenna_layouts/antenna_layout_current.csv` | Antenna CSV |
+| `--layout` | `~/software/dev/antenna_layouts/antenna_layout_mar21.csv` | Antenna CSV |
 | `--threshold` | 4.0 | sigma_1/sigma_2 cutoff |
 | `--ref-ant` | 5 | 1-indexed reference antenna |
 | `--svd-mode` | phase-only | `phase-only`, `cross-only`, `raw` |
