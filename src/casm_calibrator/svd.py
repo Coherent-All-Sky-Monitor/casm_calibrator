@@ -39,6 +39,21 @@ class SVDConfig:
     fill_mode: str = "interpolate"
     amp_weighting: str = "none"
 
+    # Subband-aware SVD with smooth gain interpolation. When
+    # ``subband_size`` is set, ``svd_calibrate`` routes through a path
+    # that (a) skips RFI-flagged channels inside each subband mean,
+    # (b) marks subbands failed if too few good channels remain or if
+    # lambda_1/lambda_2 falls below ``threshold``, (c) fits a smooth
+    # per-antenna polynomial across valid subbands weighted by quality,
+    # (d) evaluates that fit at every channel.
+    #
+    # ``subband_size=None`` (default) keeps the legacy per-channel
+    # / block_size behaviour for back-compat.
+    subband_size: int | None = None
+    subband_min_good_frac: float = 0.5
+    smooth_order: int = 3
+    fill_failed: str = "smooth_fit"   # "smooth_fit" | "zero"
+
 
 @dataclass
 class SVDResult:

@@ -124,6 +124,151 @@ def _build_hermitian_matrix(vis_full, ant, freq_mhz=None, time_unix=None,
     return mat
 
 
+def _subband_svd_with_smooth_fit(vis_hermitian, freq_mhz, freq_mask, cfg):
+    """Per-subband SVD + per-antenna smooth (poly) gain interpolation.
+
+    Parameters
+    ----------
+    vis_hermitian : ndarray, shape (n_chan, n_ant, n_ant)
+        Time-averaged, fringe-stopped Hermitian matrix per channel.
+    freq_mhz : ndarray, shape (n_chan,)
+    freq_mask : ndarray of bool, shape (n_chan,)
+        True = good channel (UN-flagged).
+    cfg : SVDConfig
+        Reads subband_size, subband_min_good_frac, threshold (used as
+        the per-subband quality threshold), smooth_order, fill_failed,
+        svd_mode, ref_ant_idx.
+
+    Returns
+    -------
+    SVDResult
+        gains/weights are per-channel (n_ant, n_chan), filled by the
+        smooth fit across valid subbands. RFI-flagged channels are
+        zeroed regardless. flags=True at channels where the smooth fit
+        is valid (i.e. inside the cal'd band and either passing the
+        subband or in a fill_failed='smooth_fit' fill region).
+    """
+    n_chan, n_ant, _ = vis_hermitian.shape
+    n_sb = max(1, int(np.ceil(n_chan / cfg.subband_size)))
+    sb_centers = np.zeros(n_sb)
+    sb_freqs = np.zeros(n_sb)
+    sb_gains = np.zeros((n_ant, n_sb), dtype=np.complex128)
+    sb_lam1 = np.zeros(n_sb)
+    sb_lam2 = np.zeros(n_sb)
+    sb_quality = np.zeros(n_sb)         # lambda_1 / lambda_2
+    sb_valid = np.zeros(n_sb, dtype=bool)
+
+    sv_calibrator = SVDCalibrator(cfg)
+
+    for k in range(n_sb):
+        c0 = k * cfg.subband_size
+        c1 = min((k + 1) * cfg.subband_size, n_chan)
+        sb_centers[k] = 0.5 * (c0 + c1 - 1)
+        sb_freqs[k] = 0.5 * (freq_mhz[c0] + freq_mhz[c1 - 1])
+
+        ch_in_sb = np.arange(c0, c1)
+        good = ch_in_sb[freq_mask[ch_in_sb]]
+        if len(good) < cfg.subband_min_good_frac * cfg.subband_size:
+            continue   # too few clean channels; subband fails
+
+        V = np.mean(vis_hermitian[good], axis=0)        # (n_ant, n_ant)
+        svd_input = sv_calibrator._prepare_svd_input(V, cfg.svd_mode)
+        U, sigma, _Vh = np.linalg.svd(svd_input)
+        sb_lam1[k] = sigma[0]
+        sb_lam2[k] = sigma[1] if len(sigma) > 1 else 0.0
+        sb_quality[k] = sigma[0] / sigma[1] if sigma[1] > 0 else np.inf
+
+        if sb_quality[k] < cfg.threshold:
+            continue
+        g = np.exp(1j * np.angle(U[:, 0]))
+        ref_phase = np.angle(g[cfg.ref_ant_idx])
+        g *= np.exp(-1j * ref_phase)
+        sb_gains[:, k] = g
+        sb_valid[k] = True
+
+    # Smooth per-antenna gain interpolation. Phase is unwrapped before
+    # fitting (linear-phase residuals across cable lengths look like
+    # straight ramps in unwrapped phase). Amplitude is fit on a linear
+    # axis; phase-only mode produces unit amplitude so that's a no-op.
+    n_valid = int(sb_valid.sum())
+    full_gains = np.zeros((n_ant, n_chan), dtype=np.complex128)
+    full_flags = np.zeros(n_chan, dtype=bool)
+
+    if n_valid >= max(2, cfg.smooth_order + 1):
+        weights = np.where(sb_valid, np.minimum(sb_quality, 1e3), 0.0)
+        x_train = sb_freqs[sb_valid]
+        w_train = weights[sb_valid]
+        order = min(cfg.smooth_order, n_valid - 1)
+
+        for i in range(n_ant):
+            phases = np.unwrap(np.angle(sb_gains[i, sb_valid]))
+            amps = np.abs(sb_gains[i, sb_valid])
+            try:
+                p_phase = np.polyfit(x_train, phases, order, w=w_train)
+                p_amp = np.polyfit(x_train, amps, min(order, 2), w=w_train)
+            except (np.linalg.LinAlgError, ValueError):
+                continue
+            phase_full = np.polyval(p_phase, freq_mhz)
+            amp_full = np.polyval(p_amp, freq_mhz)
+            full_gains[i] = amp_full * np.exp(1j * phase_full)
+
+        # Channels where the fit is meaningful: inside the cal band
+        # (i.e. not flagged by RFI). fill_failed policy decides
+        # whether SVD-failed-subband channels keep the smooth fit
+        # (default) or are zeroed.
+        in_cal_band = freq_mask  # True = unflagged
+        if cfg.fill_failed == "smooth_fit":
+            full_flags = in_cal_band.copy()
+        elif cfg.fill_failed == "zero":
+            # Per-channel: True only if the channel's subband was valid AND not RFI.
+            sb_index = np.minimum(np.arange(n_chan) // cfg.subband_size, n_sb - 1)
+            full_flags = in_cal_band & sb_valid[sb_index]
+            full_gains[:, ~full_flags] = 0.0
+        else:
+            raise ValueError(
+                f"Unknown fill_failed={cfg.fill_failed!r}; "
+                f"use 'smooth_fit' or 'zero'."
+            )
+    # else: too few valid subbands; full_flags stays all-False, gains zero.
+
+    # Always force RFI-flagged channels to zero / unflagged, regardless of
+    # fill_failed.
+    rfi_flagged = ~freq_mask
+    full_gains[:, rfi_flagged] = 0.0
+    full_flags[rfi_flagged] = False
+
+    rank1_full = np.zeros(n_chan)
+    sb_index = np.minimum(np.arange(n_chan) // cfg.subband_size, n_sb - 1)
+    rank1_full[:] = sb_quality[sb_index]
+    rank1_full[rfi_flagged] = 0.0
+
+    sv_full = np.zeros((n_chan, n_ant))
+    # Singular-value spectrum isn't recomputed per channel; we record
+    # the parent subband's pair (sigma_1, sigma_2) so plot_calibration
+    # still has something to show.
+    sv_full[:, 0] = sb_lam1[sb_index]
+    if n_ant > 1:
+        sv_full[:, 1] = sb_lam2[sb_index]
+
+    return SVDResult(
+        gains=full_gains,
+        weights=np.conj(full_gains),
+        flags=full_flags,
+        rank1_ratios=rank1_full,
+        singular_values=sv_full,
+        block_metadata={
+            "subband_size": cfg.subband_size,
+            "n_subbands": n_sb,
+            "subband_centers_mhz": sb_freqs,
+            "subband_quality": sb_quality,
+            "subband_valid": sb_valid,
+            "smooth_order": cfg.smooth_order,
+            "fill_failed": cfg.fill_failed,
+            "n_valid_subbands": n_valid,
+        },
+    )
+
+
 def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
                   time_mask=None) -> CalibrationResult:
     """Compose-friendly SVD calibration.
@@ -194,7 +339,20 @@ def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
         from dataclasses import replace
         cfg = replace(cfg, ref_ant_idx=active.index(ref_ant))
 
-    result = SVDCalibrator(cfg).calibrate(vis_avg)
+    # When subband_size is set, route through the subband path that
+    # honours fs['freq_mask'] inside each subband mean and fits a
+    # smooth per-antenna gain across valid subbands.
+    if cfg.subband_size is not None and cfg.subband_size >= 1:
+        fs_freq_mask = fs.get("freq_mask")
+        if fs_freq_mask is None:
+            fs_freq_mask = np.ones(vis_avg.shape[0], dtype=bool)
+        else:
+            fs_freq_mask = np.asarray(fs_freq_mask, dtype=bool)
+        result = _subband_svd_with_smooth_fit(
+            vis_avg, freq_mhz, fs_freq_mask, cfg
+        )
+    else:
+        result = SVDCalibrator(cfg).calibrate(vis_avg)
 
     # Honour the RFI mask carried on fs (or passed explicitly): force
     # those channels to flagged=False and zero their gains/weights so
