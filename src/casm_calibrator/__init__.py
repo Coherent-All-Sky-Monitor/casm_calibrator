@@ -31,13 +31,19 @@ class CalibrationResult(TypedDict, total=False):
     layout_version: dict
 
 
-def _build_hermitian_matrix(vis_full, ant) -> np.ndarray:
+def _build_hermitian_matrix(vis_full, ant, time_mask=None) -> np.ndarray:
     """Build (F, N, N) Hermitian matrix from full-triangle vis + AntennaMapping.
 
     ``vis_full`` is (T, F, n_inputs*(n_inputs+1)/2) — what
     ``casm_io.read_visibilities`` returns. The matrix is built over the
     *active* antennas only (so any ``ant.with_inactive([...])`` overrides
     are honoured).
+
+    ``time_mask`` (bool, shape (T,)) restricts the time-average to
+    ``time_mask=True`` samples — typically the source-above-horizon
+    transit window from ``fringe_stop``'s output. If omitted, all
+    samples are averaged, which can dilute the source signal and crush
+    lambda_1 / lambda_2.
     """
     from casm_io.correlator.baselines import triu_flat_index
 
@@ -51,8 +57,22 @@ def _build_hermitian_matrix(vis_full, ant) -> np.ndarray:
             f"got {n_bl}, doesn't match any integer n."
         )
 
-    # Time-average to (F, n_bl)
-    vis_avg = np.mean(vis_full, axis=0)
+    # Time-average to (F, n_bl). Restrict to source-up samples if asked.
+    if time_mask is not None:
+        time_mask = np.asarray(time_mask, dtype=bool)
+        if time_mask.shape[0] != vis_full.shape[0]:
+            raise ValueError(
+                f"time_mask length {time_mask.shape[0]} doesn't match "
+                f"vis time axis {vis_full.shape[0]}"
+            )
+        if not time_mask.any():
+            raise ValueError(
+                "time_mask is all-False; cannot time-average. Loosen "
+                "min_alt_deg or pass an explicit mask."
+            )
+        vis_avg = np.mean(vis_full[time_mask], axis=0)
+    else:
+        vis_avg = np.mean(vis_full, axis=0)
     n_chan = vis_avg.shape[0]
 
     pidx = [ant.packet_index(a) for a in active]
@@ -72,8 +92,8 @@ def _build_hermitian_matrix(vis_full, ant) -> np.ndarray:
     return mat
 
 
-def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None
-                  ) -> CalibrationResult:
+def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
+                  time_mask=None) -> CalibrationResult:
     """Compose-friendly SVD calibration.
 
     Parameters
@@ -91,6 +111,12 @@ def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None
     config : :class:`SVDConfig`, optional
         Defaults to ``SVDConfig()`` (per-channel, threshold=4.0,
         ref_ant_idx=0, phase-only).
+    time_mask : ndarray of bool, optional
+        Per-time-sample mask (True = include in the time average).
+        Defaults to ``fs['time_mask']`` if present, otherwise all samples.
+        This is what makes the difference between "λ₁/λ₂ is great" and
+        "λ₁/λ₂ is mush": the source has to be **up** during the averaged
+        samples or its signal gets diluted by off-source noise.
 
     Returns
     -------
@@ -110,8 +136,13 @@ def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None
     vis_full = data["vis"] if hasattr(data, "__getitem__") else data.vis
     freq_mhz = np.asarray(fs["freq_mhz"])
 
+    # Pick the time mask: explicit kwarg wins, otherwise inherit from fs
+    # (populated by fringe_stop via find_transit_window).
+    if time_mask is None:
+        time_mask = fs.get("time_mask")
+
     # Build the Hermitian matrix from full-triangle baselines.
-    vis_avg = _build_hermitian_matrix(vis_full, ant)
+    vis_avg = _build_hermitian_matrix(vis_full, ant, time_mask=time_mask)
 
     # Map the user's ref_ant onto the matrix's row index. Mutate the
     # dataclass in place rather than reconstructing it so we don't
