@@ -196,10 +196,24 @@ def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
 
     result = SVDCalibrator(cfg).calibrate(vis_avg)
 
+    # Honour the RFI mask carried on fs (or passed explicitly): force
+    # those channels to flagged=False and zero their gains/weights so
+    # downstream save/deploy never includes them.
+    flags = result.flags.copy()
+    gains = result.gains.copy()
+    weights = result.weights.copy()
+    fs_freq_mask = fs.get("freq_mask")
+    if fs_freq_mask is not None:
+        fs_freq_mask = np.asarray(fs_freq_mask, dtype=bool)
+        if fs_freq_mask.shape == flags.shape:
+            flags &= fs_freq_mask
+            gains[:, ~fs_freq_mask] = 0.0
+            weights[:, ~fs_freq_mask] = 0.0
+
     return {
-        "gains": result.gains,
-        "weights": result.weights,
-        "flags": result.flags,
+        "gains": gains,
+        "weights": weights,
+        "flags": flags,
         "rank1_ratios": result.rank1_ratios,
         "singular_values": result.singular_values,
         "freqs_mhz": freq_mhz,
