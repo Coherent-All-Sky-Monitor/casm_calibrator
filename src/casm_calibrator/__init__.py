@@ -31,7 +31,8 @@ class CalibrationResult(TypedDict, total=False):
     layout_version: dict
 
 
-def _build_hermitian_matrix(vis_full, ant, time_mask=None) -> np.ndarray:
+def _build_hermitian_matrix(vis_full, ant, freq_mhz=None, time_unix=None,
+                            source=None, time_mask=None) -> np.ndarray:
     """Build (F, N, N) Hermitian matrix from full-triangle vis + AntennaMapping.
 
     ``vis_full`` is (T, F, n_inputs*(n_inputs+1)/2) — what
@@ -39,11 +40,15 @@ def _build_hermitian_matrix(vis_full, ant, time_mask=None) -> np.ndarray:
     *active* antennas only (so any ``ant.with_inactive([...])`` overrides
     are honoured).
 
-    ``time_mask`` (bool, shape (T,)) restricts the time-average to
-    ``time_mask=True`` samples — typically the source-above-horizon
-    transit window from ``fringe_stop``'s output. If omitted, all
-    samples are averaged, which can dilute the source signal and crush
-    lambda_1 / lambda_2.
+    Fringe-stopping toward ``source`` happens BEFORE the time-average
+    when ``freq_mhz``, ``time_unix``, and ``source`` are all given.
+    Without it, raw V_ij(t, f) carries a time-rotating geometric phase
+    (the sun marches across the sky during a multi-hour integration),
+    and the time-average washes the source signal out — lambda_1 /
+    lambda_2 collapses.
+
+    ``time_mask`` (bool, shape (T,)) restricts the average to its
+    True-samples. Typically inherited from fs['time_mask'].
     """
     from casm_io.correlator.baselines import triu_flat_index
 
@@ -57,7 +62,6 @@ def _build_hermitian_matrix(vis_full, ant, time_mask=None) -> np.ndarray:
             f"got {n_bl}, doesn't match any integer n."
         )
 
-    # Time-average to (F, n_bl). Restrict to source-up samples if asked.
     if time_mask is not None:
         time_mask = np.asarray(time_mask, dtype=bool)
         if time_mask.shape[0] != vis_full.shape[0]:
@@ -70,25 +74,53 @@ def _build_hermitian_matrix(vis_full, ant, time_mask=None) -> np.ndarray:
                 "time_mask is all-False; cannot time-average. Loosen "
                 "min_alt_deg or pass an explicit mask."
             )
-        vis_avg = np.mean(vis_full[time_mask], axis=0)
-    else:
-        vis_avg = np.mean(vis_full, axis=0)
-    n_chan = vis_avg.shape[0]
 
     pidx = [ant.packet_index(a) for a in active]
 
+    # Per-antenna geometric phasor toward `source`, P_a(t, f) =
+    # exp(+2j*pi*f*tau_a(t))  with  tau_a(t) = (pos_a . s_hat(t)) / c.
+    # V_ij_fs = P_i * V_ij * conj(P_j) cancels the +2pi*f*(tau_j-tau_i)
+    # geometric rotation across time. Matches the sign convention
+    # fringe_stop_array uses with sign=-1.
+    apply_fringe_stop = (
+        freq_mhz is not None and time_unix is not None and source is not None
+    )
+    if apply_fringe_stop:
+        from casm_io.constants import C_LIGHT_M_S
+        from casm_vis_analysis.sources import source_enu
+
+        df = ant.dataframe
+        positions = np.array([
+            df.loc[df["antenna_id"] == a, ["x_m", "y_m", "z_m"]].values[0]
+            for a in active
+        ])  # (n_ant, 3)
+        s_enu = source_enu(source, time_unix)              # (T, 3)
+        tau_per_ant = (s_enu @ positions.T) / C_LIGHT_M_S  # (T, n_ant)
+        freq_hz = np.asarray(freq_mhz, dtype=np.float64) * 1e6
+        # phasors[t, f, k] = exp(+2j*pi * freq_hz[f] * tau_per_ant[t, k])
+        phasors = np.exp(
+            2j * np.pi * freq_hz[None, :, None] * tau_per_ant[:, None, :]
+        ).astype(np.complex64)                              # (T, F, n_ant)
+
+    n_chan = vis_full.shape[1]
     mat = np.zeros((n_chan, n_ant, n_ant), dtype=np.complex128)
+
     for i in range(n_ant):
         for j in range(i, n_ant):
             p_i, p_j = pidx[i], pidx[j]
             i_min, i_max = (p_i, p_j) if p_i <= p_j else (p_j, p_i)
             bl = triu_flat_index(n_inputs, i_min, i_max)
-            v = vis_avg[:, bl]
+            v = vis_full[:, :, bl]                  # (T, F)
             if p_i > p_j:
-                v = np.conj(v)        # we have V[j,i] but want V[i,j]
-            mat[:, i, j] = v
+                v = np.conj(v)                       # V[j,i] -> V[i,j]
+            if apply_fringe_stop:
+                v = v * phasors[:, :, i] * np.conj(phasors[:, :, j])
+            if time_mask is not None:
+                v = v[time_mask]
+            v_avg = np.mean(v, axis=0)               # (F,)
+            mat[:, i, j] = v_avg
             if i != j:
-                mat[:, j, i] = np.conj(v)
+                mat[:, j, i] = np.conj(v_avg)
     return mat
 
 
@@ -135,14 +167,24 @@ def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
 
     vis_full = data["vis"] if hasattr(data, "__getitem__") else data.vis
     freq_mhz = np.asarray(fs["freq_mhz"])
+    time_unix = np.asarray(fs["time_unix"]) if "time_unix" in fs else (
+        data["time_unix"] if hasattr(data, "__getitem__") else data.time_unix
+    )
 
     # Pick the time mask: explicit kwarg wins, otherwise inherit from fs
     # (populated by fringe_stop via find_transit_window).
     if time_mask is None:
         time_mask = fs.get("time_mask")
 
-    # Build the Hermitian matrix from full-triangle baselines.
-    vis_avg = _build_hermitian_matrix(vis_full, ant, time_mask=time_mask)
+    # Build the Hermitian matrix. Fringe-stops each baseline toward the
+    # source BEFORE time-averaging — without that, the rotating
+    # geometric phase washes the rank-1 structure out and lambda_1 /
+    # lambda_2 collapses.
+    vis_avg = _build_hermitian_matrix(
+        vis_full, ant,
+        freq_mhz=freq_mhz, time_unix=time_unix, source=source,
+        time_mask=time_mask,
+    )
 
     # Map the user's ref_ant onto the matrix's row index. Mutate the
     # dataclass in place rather than reconstructing it so we don't
