@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "casm_calibrator"
-version = "0.1.0"
+version = "1.0.0"
 description = "SVD-based beamformer calibration for CASM"
 requires-python = ">=3.10"
 dependencies = [
