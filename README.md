@@ -20,7 +20,7 @@ pip install -e ".[dev]"
 # Basic run — sun transit, per-channel SVD, phase-only mode
 casm-svd-calibrate \
   --data-dir /mnt/nvme3/data/casm/visibilities_64ant/ \
-  --obs "2026-03-20-05:55:45" \
+  --obs "2026-03-10-14:05:53" \
   --source sun \
   --output cal_weights.npz \
   --plots diagnostics.pdf
@@ -28,7 +28,7 @@ casm-svd-calibrate \
 # Block SVD (32 channels per block) with lower threshold
 casm-svd-calibrate \
   --data-dir /mnt/nvme3/data/casm/visibilities_64ant/ \
-  --obs "2026-03-20-05:55:45" \
+  --obs "2026-03-10-14:05:53" \
   --source sun \
   --output cal_weights.npz \
   --plots diagnostics.pdf \
@@ -38,7 +38,7 @@ casm-svd-calibrate \
 # With RFI masking
 casm-svd-calibrate \
   --data-dir /mnt/nvme3/data/casm/visibilities_64ant/ \
-  --obs "2026-03-20-05:55:45" \
+  --obs "2026-03-10-14:05:53" \
   --source sun \
   --output cal_weights.npz \
   --rfi-mask-range 375 390 \
@@ -47,66 +47,80 @@ casm-svd-calibrate \
 # Cas A calibration with custom layout and reference antenna
 casm-svd-calibrate \
   --data-dir /mnt/nvme3/data/casm/visibilities_64ant/ \
-  --obs "2026-03-20-05:55:45" \
+  --obs "2026-03-10-14:05:53" \
   --source cas_a \
-  --layout ~/software/dev/antenna_layouts/antenna_layout_mar21.csv \
-  --ref-ant 3 \
+  --layout ~/software/dev/antenna_layouts/antenna_layout_current.csv \
+  --ref-ant 5 \
   --svd-mode cross-only \
   --output cas_a_weights.npz
 ```
 
-### Python API
+### Python API (compose-friendly)
+
+The high-level entry point is `svd_calibrate(fs, ant, *, data, config=...)`. It takes the fringe-stopped output from `casm_vis_analysis.fringe_stop` plus the full-triangle visibilities from `casm_io.read_visibilities` and returns a :class:`CalibrationResult` dict ready to write with :func:`save_calibration`.
 
 ```python
-from casm_calibrator import (
-    SVDCalibrator, SVDConfig, SVDMode,
-    VisibilityLoader, CalibrationWeightsWriter,
-)
-from casm_calibrator.fringe_stop import FringeStopMatrix
-from casm_calibrator.rfi import RFIMask
-from casm_io.correlator.mapping import AntennaMapping
-from casm_vis_analysis.sources import find_transit_window
 import numpy as np
-
-# Load data
-mapping = AntennaMapping.load("antenna_layout_mar21.csv")
-vis = VisibilityLoader(mapping).load("/data/visibilities_64ant", "2026-03-20-05:55:45")
-print(vis.vis.shape)  # (T, 3072, 16, 16)
-
-# Trim to transit
-i_start, i_end = find_transit_window("sun", vis.time_unix, min_alt_deg=10.0)
-from casm_calibrator import VisibilityMatrix
-vis = VisibilityMatrix(
-    vis=vis.vis[i_start:i_end+1], freq_mhz=vis.freq_mhz,
-    time_unix=vis.time_unix[i_start:i_end+1],
-    ant_ids=vis.ant_ids, positions_enu=vis.positions_enu,
+from casm_io.correlator import read_visibilities
+from casm_io.correlator.mapping import AntennaMapping
+from casm_vis_analysis import run_fringe_stop
+from casm_calibrator import (
+    svd_calibrate, save_calibration,
+    SVDConfig, SVDMode,
 )
 
-# Fringe-stop and time-average
-vis_fs = FringeStopMatrix()(vis, "sun")
-vis_avg = np.mean(vis_fs.vis, axis=0)  # (F, n_ant, n_ant)
-
-# SVD calibration
-config = SVDConfig(threshold=2.0, ref_ant_idx=2, svd_mode=SVDMode.PHASE_ONLY)
-result = SVDCalibrator(config).calibrate(vis_avg)
-print(f"{np.sum(result.flags)}/{len(result.flags)} channels pass")
-
-# Write output (compatible with bf_weights_generator.load_calibration_weights)
-CalibrationWeightsWriter().write(
-    "cal_weights.npz", result, vis.freq_mhz, vis.ant_ids,
-    ref_ant_id=3, source="sun",
+# 1. Load visibilities + run fringe-stop (gives us fs['time_mask'], freq_mhz, etc.)
+ant  = AntennaMapping.load("antenna_layout_current.csv")
+data = read_visibilities(time_start=..., time_end=..., layout="layout_64ant")
+fs   = run_fringe_stop(
+    data_dir=..., obs="2026-03-10-14:05:53", format="layout_64ant",
+    layout="antenna_layout_current.csv", ref_ant=10, source="sun",
 )
+
+# 2. Configure SVD. svd_mode accepts either an enum or its string value.
+config = SVDConfig(
+    threshold=4.0,
+    ref_ant_idx=0,          # remapped from fs['ref_ant'] internally
+    svd_mode=SVDMode.PHASE_ONLY,   # or string "phase-only" — also: COMPLEX, CROSS_ONLY, RAW
+    subband_size=16,        # optional: subband + smooth-fit path
+    smooth_order=1,
+)
+
+# 3. Calibrate. `data` is keyword-only and required.
+cal = svd_calibrate(fs, ant, data=data, config=config)
+print(f"{int(np.sum(cal['flags']))}/{len(cal['flags'])} channels pass")
+
+# 4. Persist. Refuses to overwrite by default — pass overwrite=True to replace.
+save_calibration(cal, "cal_weights.h5", overwrite=False)
 ```
+
+`CalibrationResult` is a `TypedDict` with `gains`, `weights`, `flags`,
+`rank1_ratios`, `singular_values`, `freqs_mhz`, `ant_ids`,
+`ref_ant_id`, `source`, `layout_version` — see the class docstring for
+shapes.
 
 ### Load output with bf_weights_generator
 
 ```python
 from bf_weights_generator.snap_weights import load_calibration_weights
 
-cal = load_calibration_weights("cal_weights.npz")
+cal = load_calibration_weights("cal_weights.h5")
 print(cal.weights.shape)       # (n_ant, n_chan)
 print(cal.frequencies_hz[:3])  # ascending Hz
 print(cal.ant_ids)             # 1-indexed
+```
+
+### Low-level engine (advanced)
+
+For one-shot SVD on an externally-built `(F, N, N)` Hermitian matrix,
+the engine is exposed directly:
+
+```python
+from casm_calibrator import SVDCalibrator, SVDConfig, SVDMode
+
+result = SVDCalibrator(SVDConfig(threshold=2.0,
+                                  svd_mode=SVDMode.PHASE_ONLY)).calibrate(vis_avg)
+# result is an SVDResult dataclass (gains, weights, flags, ...).
 ```
 
 ## CLI Reference
@@ -121,7 +135,7 @@ casm-svd-calibrate --help
 | `--obs` | required | Observation base string (UTC timestamp) |
 | `--source` | required | Source: sun, cas_a, tau_a, cyg_a |
 | `--output` | required | Output NPZ path |
-| `--layout` | `~/software/dev/antenna_layouts/antenna_layout_mar21.csv` | Antenna CSV |
+| `--layout` | `~/software/dev/antenna_layouts/antenna_layout_current.csv` | Antenna CSV |
 | `--threshold` | 4.0 | sigma_1/sigma_2 cutoff |
 | `--ref-ant` | 5 | 1-indexed reference antenna |
 | `--svd-mode` | phase-only | `phase-only`, `cross-only`, `raw` |
