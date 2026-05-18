@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+__version__ = "1.0.0"
+
 from typing import TypedDict
 
 import numpy as np
@@ -29,6 +31,42 @@ class CalibrationResult(TypedDict, total=False):
     ref_ant_id: int
     source: str
     layout_version: dict
+
+
+def _build_baseline_mask(positions_enu: np.ndarray,
+                         freq_mhz_max: float,
+                         min_baseline_wavelengths: float) -> np.ndarray:
+    """Build an (n_ant, n_ant) bool mask, True = include baseline.
+
+    Excludes the autocorrelation diagonal and any baseline shorter
+    than ``min_baseline_wavelengths * lambda_min``, where
+    ``lambda_min = c / freq_mhz_max * 1e6`` is the shortest in-band
+    wavelength (most stringent cut). Mask is symmetric.
+
+    Why use the highest frequency: a baseline that's exactly k λ at
+    the band edge is shorter than k λ everywhere else in the band,
+    so cutting at λ_min ensures the criterion holds across the whole
+    band.
+
+    Parameters
+    ----------
+    positions_enu : ndarray, shape (n_ant, 3)
+        Antenna ENU coordinates in meters.
+    freq_mhz_max : float
+        Highest frequency in the band (MHz).
+    min_baseline_wavelengths : float
+        Minimum baseline length in units of the highest-frequency
+        wavelength. Baselines shorter than this are excluded.
+    """
+    from casm_io.constants import C_LIGHT_M_S
+    lam_min_m = C_LIGHT_M_S / (freq_mhz_max * 1e6)
+    threshold_m = min_baseline_wavelengths * lam_min_m
+
+    diffs = positions_enu[:, None, :] - positions_enu[None, :, :]
+    bl_lengths = np.linalg.norm(diffs, axis=-1)   # (n_ant, n_ant)
+    mask = bl_lengths >= threshold_m
+    np.fill_diagonal(mask, False)
+    return mask
 
 
 def _build_hermitian_matrix(vis_full, ant, freq_mhz=None, time_unix=None,
@@ -124,7 +162,8 @@ def _build_hermitian_matrix(vis_full, ant, freq_mhz=None, time_unix=None,
     return mat
 
 
-def _subband_svd_with_smooth_fit(vis_hermitian, freq_mhz, freq_mask, cfg):
+def _subband_svd_with_smooth_fit(vis_hermitian, freq_mhz, freq_mask, cfg,
+                                  baseline_mask=None):
     """Per-subband SVD + per-antenna smooth (poly) gain interpolation.
 
     Parameters
@@ -158,7 +197,7 @@ def _subband_svd_with_smooth_fit(vis_hermitian, freq_mhz, freq_mask, cfg):
     sb_quality = np.zeros(n_sb)         # lambda_1 / lambda_2
     sb_valid = np.zeros(n_sb, dtype=bool)
 
-    sv_calibrator = SVDCalibrator(cfg)
+    sv_calibrator = SVDCalibrator(cfg, baseline_mask=baseline_mask)
 
     for k in range(n_sb):
         c0 = k * cfg.subband_size
@@ -172,7 +211,9 @@ def _subband_svd_with_smooth_fit(vis_hermitian, freq_mhz, freq_mask, cfg):
             continue   # too few clean channels; subband fails
 
         V = np.mean(vis_hermitian[good], axis=0)        # (n_ant, n_ant)
-        svd_input = sv_calibrator._prepare_svd_input(V, cfg.svd_mode)
+        svd_input = sv_calibrator._prepare_svd_input(
+            V, cfg.svd_mode, baseline_mask=baseline_mask
+        )
         U, sigma, _Vh = np.linalg.svd(svd_input)
         sb_lam1[k] = sigma[0]
         sb_lam2[k] = sigma[1] if len(sigma) > 1 else 0.0
@@ -180,9 +221,15 @@ def _subband_svd_with_smooth_fit(vis_hermitian, freq_mhz, freq_mask, cfg):
 
         if sb_quality[k] < cfg.threshold:
             continue
-        g = np.exp(1j * np.angle(U[:, 0]))
-        ref_phase = np.angle(g[cfg.ref_ant_idx])
-        g *= np.exp(-1j * ref_phase)
+        if cfg.svd_mode == SVDMode.COMPLEX:
+            g = U[:, 0] * np.sqrt(sigma[0])
+            ref = g[cfg.ref_ant_idx]
+            if np.abs(ref) > 0:
+                g = g * (np.conj(ref) / np.abs(ref))
+        else:
+            g = np.exp(1j * np.angle(U[:, 0]))
+            ref_phase = np.angle(g[cfg.ref_ant_idx])
+            g *= np.exp(-1j * ref_phase)
         sb_gains[:, k] = g
         sb_valid[k] = True
 
@@ -231,11 +278,27 @@ def _subband_svd_with_smooth_fit(vis_hermitian, freq_mhz, freq_mask, cfg):
             )
     # else: too few valid subbands; full_flags stays all-False, gains zero.
 
-    # Always force RFI-flagged channels to zero / unflagged, regardless of
-    # fill_failed.
+    # Apply the chosen masked-band strategy at RFI-flagged channels.
+    # See SVDConfig.masked_band_strategy for the rationale.
     rfi_flagged = ~freq_mask
-    full_gains[:, rfi_flagged] = 0.0
-    full_flags[rfi_flagged] = False
+    strategy = getattr(cfg, "masked_band_strategy", "zero")
+    if strategy == "zero":
+        full_gains[:, rfi_flagged] = 0.0
+        full_flags[rfi_flagged] = False
+    elif strategy == "geo_fallback":
+        # Unit-amplitude, zero-phase cal → F-engine deploys geometric
+        # phase only at these channels.
+        full_gains[:, rfi_flagged] = 1.0 + 0j
+        full_flags[rfi_flagged] = True
+    elif strategy == "extrapolate":
+        # Leave the smooth-fit polynomial values intact (they were fit
+        # across the whole band); just mark the channels as good.
+        full_flags[rfi_flagged] = True
+    else:
+        raise ValueError(
+            f"Unknown masked_band_strategy={strategy!r}; "
+            f"expected 'zero', 'geo_fallback', or 'extrapolate'."
+        )
 
     rank1_full = np.zeros(n_chan)
     sb_index = np.minimum(np.arange(n_chan) // cfg.subband_size, n_sb - 1)
@@ -269,9 +332,14 @@ def _subband_svd_with_smooth_fit(vis_hermitian, freq_mhz, freq_mask, cfg):
     )
 
 
-def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
+def svd_calibrate(fs, ant, *, data, config: SVDConfig | None = None,
                   time_mask=None) -> CalibrationResult:
     """Compose-friendly SVD calibration.
+
+    Must be called as ``svd_calibrate(fs, ant, data=..., ...)``. ``data``
+    is keyword-only and required — SVD needs the full N x N Hermitian
+    matrix, which can only be built from the full-triangle visibilities,
+    not the ref+target subset carried on ``fs``.
 
     Parameters
     ----------
@@ -280,7 +348,7 @@ def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
         ``freq_mhz``, ``ref_ant``, ``source`` (provenance).
     ant : :class:`casm_io.AntennaMapping`
         Active set for the matrix (respects ``with_inactive`` overrides).
-    data : VisibilityResult or dict-like
+    data : VisibilityResult or dict-like, keyword-only, required
         The full-triangle visibilities from
         :func:`casm_io.read_visibilities`. Required: SVD needs the full
         N x N Hermitian matrix, which can only be built from all
@@ -299,13 +367,6 @@ def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
     -------
     cal : :class:`CalibrationResult`
     """
-    if data is None:
-        raise ValueError(
-            "svd_calibrate needs the full-triangle visibility data: "
-            "pass `data=` (the dict from read_visibilities). The fringe-"
-            "stopped subset only carries ref<->target baselines, which "
-            "is not enough for the full Hermitian matrix the SVD wants."
-        )
     cfg = config if config is not None else SVDConfig()
     ref_ant = int(fs.get("ref_ant"))
     source = fs.get("source", "")
@@ -339,6 +400,23 @@ def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
         from dataclasses import replace
         cfg = replace(cfg, ref_ant_idx=active.index(ref_ant))
 
+    # Optional: build a baseline-length mask. Excludes baselines too
+    # short to satisfy the rank-1 source assumption for the calibrator
+    # source — at 410 MHz, sub-1.5λ baselines see solar corona /
+    # Galactic background structure that contaminates lambda_2.
+    baseline_mask = None
+    if cfg.min_baseline_wavelengths is not None:
+        df = ant.dataframe
+        positions = np.array([
+            df.loc[df["antenna_id"] == a, ["x_m", "y_m", "z_m"]].values[0]
+            for a in active
+        ])
+        baseline_mask = _build_baseline_mask(
+            positions,
+            float(np.max(freq_mhz)),
+            cfg.min_baseline_wavelengths,
+        )
+
     # When subband_size is set, route through the subband path that
     # honours fs['freq_mask'] inside each subband mean and fits a
     # smooth per-antenna gain across valid subbands.
@@ -349,24 +427,43 @@ def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
         else:
             fs_freq_mask = np.asarray(fs_freq_mask, dtype=bool)
         result = _subband_svd_with_smooth_fit(
-            vis_avg, freq_mhz, fs_freq_mask, cfg
+            vis_avg, freq_mhz, fs_freq_mask, cfg,
+            baseline_mask=baseline_mask,
         )
     else:
-        result = SVDCalibrator(cfg).calibrate(vis_avg)
+        result = SVDCalibrator(cfg, baseline_mask=baseline_mask).calibrate(vis_avg)
 
-    # Honour the RFI mask carried on fs (or passed explicitly): force
-    # those channels to flagged=False and zero their gains/weights so
-    # downstream save/deploy never includes them.
+    # Honour the RFI mask carried on fs (or passed explicitly).
+    # Behaviour at flagged channels follows ``cfg.masked_band_strategy``:
+    #   - 'zero': flags=False, gains=0 (default; safe).
+    #   - 'geo_fallback': flags=True, gains=1 (geo-only deploy).
+    #   - 'extrapolate': flags=True, gains=polynomial smooth-fit values.
     flags = result.flags.copy()
     gains = result.gains.copy()
     weights = result.weights.copy()
     fs_freq_mask = fs.get("freq_mask")
+    strategy = getattr(cfg, "masked_band_strategy", "zero")
     if fs_freq_mask is not None:
         fs_freq_mask = np.asarray(fs_freq_mask, dtype=bool)
         if fs_freq_mask.shape == flags.shape:
-            flags &= fs_freq_mask
-            gains[:, ~fs_freq_mask] = 0.0
-            weights[:, ~fs_freq_mask] = 0.0
+            rfi = ~fs_freq_mask
+            if strategy == "zero":
+                flags &= fs_freq_mask
+                gains[:, rfi] = 0.0
+                weights[:, rfi] = 0.0
+            elif strategy == "geo_fallback":
+                flags |= rfi               # mark "good" so deploy passes channel
+                gains[:, rfi] = 1.0 + 0j   # unit cal → geo only
+                weights[:, rfi] = 1.0 + 0j
+            elif strategy == "extrapolate":
+                flags |= rfi               # mark "good" so deploy passes channel
+                # Leave gains/weights as the polynomial smooth-fit
+                # values already in the result.
+            else:
+                raise ValueError(
+                    f"Unknown masked_band_strategy={strategy!r}; "
+                    f"expected 'zero', 'geo_fallback', or 'extrapolate'."
+                )
 
     return {
         "gains": gains,
@@ -382,7 +479,8 @@ def svd_calibrate(fs, ant, data=None, *, config: SVDConfig | None = None,
     }
 
 
-def save_calibration(cal, path, *, n_time_averaged=0, rfi_mask=None):
+def save_calibration(cal, path, *, n_time_averaged=0, rfi_mask=None,
+                     overwrite=False):
     """Save a :class:`CalibrationResult` dict.
 
     Output format is chosen by the file extension:
@@ -411,9 +509,19 @@ def save_calibration(cal, path, *, n_time_averaged=0, rfi_mask=None):
         Per-channel mask (True=good). Combined (AND) with ``cal['flags']``
         before writing. Channels where the combined mask is False have
         their weights and gains zeroed.
+    overwrite : bool, optional
+        If False (default), raise ``FileExistsError`` when ``path``
+        already exists. Pass ``overwrite=True`` to replace the existing
+        file. The parent directory is created automatically.
     """
     from pathlib import Path
     p = Path(path)
+
+    if p.exists() and not overwrite:
+        raise FileExistsError(
+            f"Cal file exists: {p}. Pass overwrite=True to replace."
+        )
+    p.parent.mkdir(parents=True, exist_ok=True)
 
     flags = np.asarray(cal["flags"]).copy()
     if rfi_mask is not None:

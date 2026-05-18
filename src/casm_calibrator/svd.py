@@ -7,11 +7,18 @@ import numpy as np
 
 
 class SVDMode(Enum):
-    """SVD input matrix preparation mode."""
+    """SVD input matrix preparation mode.
+
+    ``COMPLEX`` is amplitude+phase: gains are taken as
+    ``U[:, 0] * sqrt(sigma[0])`` and then phase-referenced to
+    ``ref_ant_idx`` while leaving |g_i| free. The other three modes
+    (CROSS_ONLY/PHASE_ONLY/RAW) force unit-amplitude phase-only gains.
+    """
 
     CROSS_ONLY = "cross-only"
     PHASE_ONLY = "phase-only"
     RAW = "raw"
+    COMPLEX = "complex"
 
 
 @dataclass
@@ -30,6 +37,17 @@ class SVDConfig:
         Number of channels per block. 1 = per-channel SVD.
     fill_mode : str
         How to handle failed blocks: 'interpolate', 'zero', or 'nearest'.
+    min_baseline_wavelengths : float, optional
+        If set, baselines whose ENU separation is shorter than this
+        many wavelengths at the highest in-band frequency are excluded
+        from the SVD (zeroed in the input matrix). Standard
+        radio-interferometry self-cal practice: short baselines see
+        large-scale extended emission (e.g. 410 MHz solar corona,
+        Galactic background) that doesn't satisfy the rank-1 source
+        assumption and so contaminates lambda_2. ``None`` (default) =
+        no cut, current behaviour. ``1.5`` is a common starting point.
+        Requires ``svd_calibrate`` to be called with the antenna
+        mapping (it pulls positions from there).
     """
 
     threshold: float = 4.0
@@ -53,6 +71,38 @@ class SVDConfig:
     subband_min_good_frac: float = 0.5
     smooth_order: int = 3
     fill_failed: str = "smooth_fit"   # "smooth_fit" | "zero"
+
+    # What to do at channels that the per-observation RFI mask flagged
+    # as bad. Default is to zero them — RFI dominates these channels at
+    # 30-50 dB above thermal noise, and a phase-only cal can't reduce
+    # power, so passing the channel through any calibration gives a
+    # net SNR loss vs zero (RFI gets squared into intensity).
+    #
+    # ``"zero"``           : gains = 0, flags = False at masked channels.
+    #                        F-engine output is exactly 0; the channel
+    #                        contributes nothing. Safe default.
+    # ``"geo_fallback"``   : gains = 1 (unit cal), flags = True. F-engine
+    #                        applies geometric phase only — useful only
+    #                        if you know a "masked" channel is actually
+    #                        clean tonight (low cal SNR at build time but
+    #                        no real RFI).
+    # ``"extrapolate"``    : gains = polynomial smooth-fit values, flags
+    #                        = True. The smooth_fit polynomial covers the
+    #                        whole band; this option just doesn't zero
+    #                        its values at masked channels. Best choice
+    #                        for low-cal-SNR-but-RFI-clean channels.
+    masked_band_strategy: str = "zero"
+
+    min_baseline_wavelengths: float | None = None
+
+    def __post_init__(self):
+        if isinstance(self.svd_mode, str):
+            try:
+                self.svd_mode = SVDMode(self.svd_mode)
+            except ValueError:
+                raise TypeError(
+                    f"svd_mode must be SVDMode enum or matching string; got {self.svd_mode!r}"
+                )
 
 
 @dataclass
@@ -93,8 +143,10 @@ class SVDCalibrator:
         Calibration configuration.
     """
 
-    def __init__(self, config: SVDConfig):
+    def __init__(self, config: SVDConfig,
+                 baseline_mask: np.ndarray | None = None):
         self.config = config
+        self.baseline_mask = baseline_mask
 
     def calibrate(self, vis_avg: np.ndarray) -> SVDResult:
         """Run SVD calibration on time-averaged visibilities.
@@ -180,7 +232,8 @@ class SVDCalibrator:
 
         for ch in range(n_chan):
             V = vis_avg[ch]
-            svd_input = self._prepare_svd_input(V, cfg.svd_mode)
+            svd_input = self._prepare_svd_input(V, cfg.svd_mode,
+                                                baseline_mask=self.baseline_mask)
 
             U, sigma, _Vh = np.linalg.svd(svd_input)
             singular_values[ch] = sigma
@@ -192,9 +245,19 @@ class SVDCalibrator:
 
             if rank1_ratios[ch] >= cfg.threshold:
                 flags[ch] = True
-                g = np.exp(1j * np.angle(U[:, 0]))
-                ref_phase = np.angle(g[cfg.ref_ant_idx])
-                g *= np.exp(-1j * ref_phase)
+                if cfg.svd_mode == SVDMode.COMPLEX:
+                    # Amplitude+phase: scale leading singular vector by
+                    # sqrt(sigma_1) so |g_i| reflects per-antenna
+                    # sensitivity. Then phase-reference to ref_ant
+                    # without normalising amplitudes.
+                    g = U[:, 0] * np.sqrt(sigma[0])
+                    ref = g[cfg.ref_ant_idx]
+                    if np.abs(ref) > 0:
+                        g = g * (np.conj(ref) / np.abs(ref))
+                else:
+                    g = np.exp(1j * np.angle(U[:, 0]))
+                    ref_phase = np.angle(g[cfg.ref_ant_idx])
+                    g *= np.exp(-1j * ref_phase)
                 gains[:, ch] = g
                 weights[:, ch] = np.conj(g)
 
@@ -224,7 +287,8 @@ class SVDCalibrator:
             block_centers[b] = 0.5 * (ch_start + ch_end - 1)
 
             V_block = np.mean(vis_avg[ch_start:ch_end], axis=0)
-            svd_input = self._prepare_svd_input(V_block, cfg.svd_mode)
+            svd_input = self._prepare_svd_input(V_block, cfg.svd_mode,
+                                                baseline_mask=self.baseline_mask)
 
             U, sigma, _Vh = np.linalg.svd(svd_input)
 
@@ -235,9 +299,15 @@ class SVDCalibrator:
 
             if block_ratios[b] >= cfg.threshold:
                 block_flags[b] = True
-                g = np.exp(1j * np.angle(U[:, 0]))
-                ref_phase = np.angle(g[cfg.ref_ant_idx])
-                g *= np.exp(-1j * ref_phase)
+                if cfg.svd_mode == SVDMode.COMPLEX:
+                    g = U[:, 0] * np.sqrt(sigma[0])
+                    ref = g[cfg.ref_ant_idx]
+                    if np.abs(ref) > 0:
+                        g = g * (np.conj(ref) / np.abs(ref))
+                else:
+                    g = np.exp(1j * np.angle(U[:, 0]))
+                    ref_phase = np.angle(g[cfg.ref_ant_idx])
+                    g *= np.exp(-1j * ref_phase)
                 block_gains[:, b] = g
 
         n_good_blocks = np.sum(block_flags)
@@ -253,13 +323,22 @@ class SVDCalibrator:
                 for ant in range(n_ant):
                     phases_good = np.angle(block_gains[ant, good_idx])
                     phases_unwrap = np.unwrap(phases_good)
+                    amps_good = np.abs(block_gains[ant, good_idx])
                     centers_good = block_centers[good_idx]
 
                     if cfg.fill_mode == "interpolate":
                         phases_filled = np.interp(
                             block_centers[bad_idx], centers_good, phases_unwrap
                         )
-                        block_gains[ant, bad_idx] = np.exp(1j * phases_filled)
+                        if cfg.svd_mode == SVDMode.COMPLEX:
+                            amps_filled = np.interp(
+                                block_centers[bad_idx], centers_good, amps_good
+                            )
+                        else:
+                            amps_filled = np.ones_like(phases_filled)
+                        block_gains[ant, bad_idx] = (
+                            amps_filled * np.exp(1j * phases_filled)
+                        )
                     else:  # nearest
                         for bi in bad_idx:
                             nearest = good_idx[
@@ -307,13 +386,31 @@ class SVDCalibrator:
         )
 
     @staticmethod
-    def _prepare_svd_input(V: np.ndarray, mode: SVDMode) -> np.ndarray:
-        """Prepare matrix for SVD based on mode."""
+    def _prepare_svd_input(V: np.ndarray, mode: SVDMode,
+                           baseline_mask: np.ndarray | None = None) -> np.ndarray:
+        """Prepare matrix for SVD based on mode.
+
+        The autocorrelation diagonal is always zeroed: it carries no
+        phase information (V_ii is real-positive), and leaving it as
+        ``exp(i*angle(V_ii)) = 1`` in PHASE_ONLY mode added a constant
+        all-ones rank-1 component independent of the source signal —
+        small bias in practice but inconsistent with CROSS_ONLY's
+        treatment.
+
+        ``baseline_mask`` (n_ant, n_ant) bool, optional: True = include,
+        False = exclude. Excluded baselines are zeroed in the input.
+        Used to drop short baselines whose extended-source structure
+        breaks the rank-1 assumption.
+        """
         if mode == SVDMode.PHASE_ONLY:
-            return np.exp(1j * np.angle(V))
+            out = np.exp(1j * np.angle(V))
         elif mode == SVDMode.CROSS_ONLY:
-            out = V.copy()
-            np.fill_diagonal(out, 0)
-            return out
-        else:  # RAW
-            return V
+            out = V.astype(np.complex128, copy=True)
+        else:  # RAW / COMPLEX (both keep amplitude)
+            out = V.astype(np.complex128, copy=True)
+
+        np.fill_diagonal(out, 0)
+
+        if baseline_mask is not None:
+            out = out * baseline_mask
+        return out
