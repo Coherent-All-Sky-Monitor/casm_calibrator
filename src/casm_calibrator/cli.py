@@ -28,10 +28,12 @@ def main(argv=None):
     parser.add_argument("--format", default=None, help="Visibility format name (auto-detect if omitted)")
     parser.add_argument(
         "--layout",
-        default=os.path.expanduser(
-            "~/software/dev/antenna_layouts/antenna_layout_current.csv"
+        default=None,
+        help=(
+            "Antenna layout CSV path. Default: the canonical layout, "
+            "resolved via $CASM_LAYOUT_CSV then $CASM_LAYOUT_DIR/current "
+            "(the same file every other CASM tool uses)."
         ),
-        help="Antenna layout CSV path",
     )
     parser.add_argument("--source", required=True, help="Source name: sun, cas_a, tau_a, cyg_a")
     parser.add_argument("--output", required=True, help="Output weights NPZ path")
@@ -79,9 +81,12 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
 
-    # 1. Load antenna layout
-    print(f"Loading antenna layout: {args.layout}")
-    mapping = AntennaMapping.load(args.layout)
+    # 1. Load antenna layout (None resolves to the canonical CSV via
+    # casm_io.constants.resolve_layout_path)
+    from casm_io.constants import resolve_layout_path
+    layout_path = resolve_layout_path(args.layout)
+    print(f"Loading antenna layout: {layout_path}")
+    mapping = AntennaMapping.load(layout_path)
     ant_ids = np.array(mapping.active_antennas(), dtype=int)
     n_ant = len(ant_ids)
     print(f"  {n_ant} active antennas: {ant_ids}")
