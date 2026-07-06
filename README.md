@@ -40,7 +40,7 @@ fs = fringe_stop(data, ant, ref_ant=9, source="sun", sign=-1)
 
 cfg = SVDConfig(
     threshold=5.0,                        # recommended for strong cal sources
-    svd_mode=SVDMode.PHASE_ONLY,          # recommended; most robust
+    svd_mode=SVDMode.PHASE_ONLY,          # best pass rate on this array
     masked_band_strategy="zero",          # recommended; zeros RFI-flagged channels
 )
 
