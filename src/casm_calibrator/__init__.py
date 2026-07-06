@@ -233,42 +233,101 @@ def _subband_svd_with_smooth_fit(vis_hermitian, freq_mhz, freq_mask, cfg,
         sb_gains[:, k] = g
         sb_valid[k] = True
 
-    # Smooth per-antenna gain interpolation. Phase is unwrapped before
-    # fitting (linear-phase residuals across cable lengths look like
-    # straight ramps in unwrapped phase). Amplitude is fit on a linear
-    # axis; phase-only mode produces unit amplitude so that's a no-op.
+    # Stage 2: fill per-channel cal phase from per-subband SVD results.
+    #
+    # ``subband_fill_method`` selects:
+    #   "global_poly"  : ONE polynomial of degree ``smooth_order`` per
+    #                    antenna across all valid subbands. Fast and
+    #                    smooth, but fails when np.unwrap can't track
+    #                    multi-cycle phase rolls across wide RFI gaps
+    #                    for high-cable-delay antennas.
+    #   "local_linear" : For each failed subband, fit a line through
+    #                    ``local_interp_n_neighbors`` valid neighbors on
+    #                    each side; per-channel output = phase of the
+    #                    containing subband. No global unwrap.
     n_valid = int(sb_valid.sum())
     full_gains = np.zeros((n_ant, n_chan), dtype=np.complex128)
     full_flags = np.zeros(n_chan, dtype=bool)
+    sb_index = np.minimum(np.arange(n_chan) // cfg.subband_size, n_sb - 1)
 
-    if n_valid >= max(2, cfg.smooth_order + 1):
-        weights = np.where(sb_valid, np.minimum(sb_quality, 1e3), 0.0)
-        x_train = sb_freqs[sb_valid]
-        w_train = weights[sb_valid]
-        order = min(cfg.smooth_order, n_valid - 1)
+    method = getattr(cfg, "subband_fill_method", "global_poly")
 
-        for i in range(n_ant):
-            phases = np.unwrap(np.angle(sb_gains[i, sb_valid]))
-            amps = np.abs(sb_gains[i, sb_valid])
-            try:
-                p_phase = np.polyfit(x_train, phases, order, w=w_train)
-                p_amp = np.polyfit(x_train, amps, min(order, 2), w=w_train)
-            except (np.linalg.LinAlgError, ValueError):
-                continue
-            phase_full = np.polyval(p_phase, freq_mhz)
-            amp_full = np.polyval(p_amp, freq_mhz)
-            full_gains[i] = amp_full * np.exp(1j * phase_full)
+    if method == "global_poly":
+        if n_valid >= max(2, cfg.smooth_order + 1):
+            weights = np.where(sb_valid, np.minimum(sb_quality, 1e3), 0.0)
+            x_train = sb_freqs[sb_valid]
+            w_train = weights[sb_valid]
+            order = min(cfg.smooth_order, n_valid - 1)
 
-        # Channels where the fit is meaningful: inside the cal band
-        # (i.e. not flagged by RFI). fill_failed policy decides
-        # whether SVD-failed-subband channels keep the smooth fit
-        # (default) or are zeroed.
+            for i in range(n_ant):
+                phases = np.unwrap(np.angle(sb_gains[i, sb_valid]))
+                amps = np.abs(sb_gains[i, sb_valid])
+                try:
+                    p_phase = np.polyfit(x_train, phases, order, w=w_train)
+                    p_amp = np.polyfit(x_train, amps, min(order, 2), w=w_train)
+                except (np.linalg.LinAlgError, ValueError):
+                    continue
+                phase_full = np.polyval(p_phase, freq_mhz)
+                amp_full = np.polyval(p_amp, freq_mhz)
+                full_gains[i] = amp_full * np.exp(1j * phase_full)
+        # else: too few valid subbands; gains stay zero.
+
+    elif method == "local_linear":
+        # No global unwrap. For each subband (valid or failed) assign a
+        # per-antenna phase. Valid subbands keep their SVD result; failed
+        # subbands get a linear fit through K nearest valid neighbors per
+        # side (using local-only np.unwrap, which is safe because adjacent
+        # valid subbands have phase differences << pi at typical CASM cable
+        # delays). Per-channel gain = phase of the containing subband.
+        K = int(getattr(cfg, "local_interp_n_neighbors", 2))
+        valid_idxs = np.where(sb_valid)[0]
+        if n_valid >= 2:
+            ref_idx = int(cfg.ref_ant_idx)
+            for i in range(n_ant):
+                # Reference antenna is identically zero phase per Stage 1
+                # convention; leave full_gains[i] = exp(i*0) = 1 below.
+                # (We still fill per-subband to keep the shape consistent.)
+                for k in range(n_sb):
+                    if sb_valid[k]:
+                        phi_k = np.angle(sb_gains[i, k])
+                    else:
+                        left = valid_idxs[valid_idxs < k]
+                        right = valid_idxs[valid_idxs > k]
+                        use = np.concatenate([left[-K:], right[:K]])
+                        if use.size == 0:
+                            phi_k = 0.0
+                        elif use.size == 1:
+                            phi_k = np.angle(sb_gains[i, int(use[0])])
+                        else:
+                            f_loc = sb_freqs[use]
+                            p_loc = np.angle(sb_gains[i, use])
+                            order_loc = np.argsort(f_loc)
+                            f_loc = f_loc[order_loc]
+                            p_loc_uw = np.unwrap(p_loc[order_loc])
+                            coefs = np.polyfit(f_loc, p_loc_uw, 1)
+                            phi_k = float(np.polyval(coefs, sb_freqs[k]))
+                    c0 = k * cfg.subband_size
+                    c1 = min((k + 1) * cfg.subband_size, n_chan)
+                    full_gains[i, c0:c1] = np.exp(1j * phi_k)
+        # else: too few valid subbands; gains stay zero.
+
+    else:
+        raise ValueError(
+            f"Unknown subband_fill_method={method!r}; "
+            f"expected 'global_poly' or 'local_linear'."
+        )
+
+    # Flag policy: which channels are 'good' after Stage 2.
+    if n_valid >= 2:
         in_cal_band = freq_mask  # True = unflagged
-        if cfg.fill_failed == "smooth_fit":
+        if method == "local_linear":
+            # All subbands have a phase (valid or interpolated). The
+            # masked_band_strategy block below decides what happens at
+            # RFI-flagged channels.
+            full_flags = in_cal_band.copy()
+        elif cfg.fill_failed == "smooth_fit":
             full_flags = in_cal_band.copy()
         elif cfg.fill_failed == "zero":
-            # Per-channel: True only if the channel's subband was valid AND not RFI.
-            sb_index = np.minimum(np.arange(n_chan) // cfg.subband_size, n_sb - 1)
             full_flags = in_cal_band & sb_valid[sb_index]
             full_gains[:, ~full_flags] = 0.0
         else:
@@ -276,7 +335,6 @@ def _subband_svd_with_smooth_fit(vis_hermitian, freq_mhz, freq_mask, cfg,
                 f"Unknown fill_failed={cfg.fill_failed!r}; "
                 f"use 'smooth_fit' or 'zero'."
             )
-    # else: too few valid subbands; full_flags stays all-False, gains zero.
 
     # Apply the chosen masked-band strategy at RFI-flagged channels.
     # See SVDConfig.masked_band_strategy for the rationale.

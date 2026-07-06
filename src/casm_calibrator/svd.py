@@ -72,6 +72,27 @@ class SVDConfig:
     smooth_order: int = 3
     fill_failed: str = "smooth_fit"   # "smooth_fit" | "zero"
 
+    # How to fill per-channel cal phase from per-subband SVD results.
+    #
+    # ``"global_poly"`` (default, legacy):
+    #     ONE polynomial of degree ``smooth_order`` is fit across ALL valid
+    #     subbands' phase points per antenna. Phase is unwrapped *globally*
+    #     before fitting, then the polynomial is evaluated at every channel.
+    #     Vulnerable to ``np.unwrap`` failures across wide RFI gaps for
+    #     high-cable-delay antennas: a single bad unwrap rotates the entire
+    #     fitted line.
+    #
+    # ``"local_linear"`` (recommended for high-tau arrays):
+    #     For each failed subband, find the K=``local_interp_n_neighbors``
+    #     nearest valid subbands on each side, locally unwrap just those
+    #     points, fit a linear ``phi = a + b*f``, and evaluate at the
+    #     failed-subband center freq. Per-channel output = phase of the
+    #     containing subband. No global unwrap — immune to wide-gap
+    #     unwrap errors that broke ``"global_poly"`` for antennas with
+    #     cable delay > ~88 ns under the v3 RFI mask.
+    subband_fill_method: str = "global_poly"
+    local_interp_n_neighbors: int = 2
+
     # What to do at channels that the per-observation RFI mask flagged
     # as bad. Default is to zero them — RFI dominates these channels at
     # 30-50 dB above thermal noise, and a phase-only cal can't reduce
@@ -267,6 +288,9 @@ class SVDCalibrator:
             flags=flags,
             rank1_ratios=rank1_ratios,
             singular_values=singular_values,
+            # Record the acceptance threshold so saved calibrations carry
+            # their provenance (CalibrationWeightsWriter reads this key).
+            block_metadata={"threshold": cfg.threshold},
         )
 
     def _per_block_svd(self, vis_avg: np.ndarray) -> SVDResult:
@@ -382,6 +406,7 @@ class SVDCalibrator:
                 "block_size": block_size,
                 "block_centers": block_centers,
                 "fill_mode": cfg.fill_mode,
+                "threshold": cfg.threshold,
             },
         )
 

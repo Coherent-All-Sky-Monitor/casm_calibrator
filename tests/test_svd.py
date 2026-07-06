@@ -344,3 +344,83 @@ def test_masked_band_strategy_invalid():
     import pytest
     with pytest.raises(ValueError, match="Unknown masked_band_strategy"):
         _subband_svd_with_smooth_fit(H, freqs, freq_mask, cfg)
+
+
+class TestThresholdProvenance:
+    """Saved calibrations must record the threshold actually used.
+
+    Both SVD paths store it in block_metadata, which
+    CalibrationWeightsWriter reads when writing the NPZ. Before this was
+    pinned down, every saved file claimed threshold=0.0.
+    """
+
+    def test_per_channel_records_threshold(self, rank1_vis):
+        vis_avg, _ = rank1_vis
+        config = SVDConfig(threshold=3.5, ref_ant_idx=0, svd_mode=SVDMode.PHASE_ONLY)
+        result = SVDCalibrator(config).calibrate(vis_avg)
+        assert result.block_metadata["threshold"] == 3.5
+
+    def test_per_block_records_threshold(self, n_ant, n_chan):
+        rng = np.random.default_rng(7)
+        vis_avg, _ = _coherent_block_vis(n_ant, n_chan, rng)
+        config = SVDConfig(
+            threshold=2.5, ref_ant_idx=0, svd_mode=SVDMode.PHASE_ONLY, block_size=8
+        )
+        result = SVDCalibrator(config).calibrate(vis_avg)
+        assert result.block_metadata["threshold"] == 2.5
+
+
+def test_subband_fill_method_local_linear():
+    """local_linear fills failed subbands from neighbors, no global unwrap."""
+    from casm_calibrator import SVDConfig, SVDMode
+    from casm_calibrator import _subband_svd_with_smooth_fit
+
+    rng = np.random.default_rng(11)
+    n_chan = 64; n_ant = 6
+    freqs = np.linspace(420.0, 450.0, n_chan)
+    true_phases = rng.uniform(-np.pi, np.pi, n_ant)
+    gains = np.exp(1j * true_phases)
+    H = _make_synth_hermitian(n_chan, n_ant, gains, freqs, rng)
+
+    # RFI gap in the middle of the band: two subbands fail, valid
+    # neighbors exist on both sides for the local fit.
+    freq_mask = np.ones(n_chan, dtype=bool)
+    freq_mask[24:40] = False
+
+    cfg = SVDConfig(threshold=1.5, svd_mode=SVDMode.PHASE_ONLY,
+                    subband_size=8, subband_min_good_frac=0.5,
+                    smooth_order=2, fill_failed="smooth_fit",
+                    subband_fill_method="local_linear")
+    res = _subband_svd_with_smooth_fit(H, freqs, freq_mask, cfg)
+
+    # The fixture applies phase(i, f) = theta_i + 2*pi*f*1e-3*i (a linear
+    # cable-delay ramp per antenna); referenced to ref_ant, that ramp must
+    # be recovered across the whole band — including the gap, where the
+    # local linear fill extrapolates it from neighboring valid subbands.
+    solved = res.gains != 0.0
+    assert solved.any()
+    for i in range(n_ant):
+        expected = (true_phases[i] - true_phases[cfg.ref_ant_idx]
+                    + 2 * np.pi * freqs * 1e-3 * i)
+        err = np.angle(res.gains[i] * np.exp(-1j * expected))[solved[i]]
+        assert np.max(np.abs(err)) < 0.2
+
+
+def test_subband_fill_method_invalid():
+    from casm_calibrator import SVDConfig, SVDMode
+    from casm_calibrator import _subband_svd_with_smooth_fit
+
+    rng = np.random.default_rng(12)
+    n_chan = 64; n_ant = 6
+    freqs = np.linspace(420.0, 450.0, n_chan)
+    gains = np.exp(1j * rng.uniform(-np.pi, np.pi, n_ant))
+    H = _make_synth_hermitian(n_chan, n_ant, gains, freqs, rng)
+    freq_mask = np.ones(n_chan, dtype=bool)
+
+    cfg = SVDConfig(threshold=1.5, svd_mode=SVDMode.PHASE_ONLY,
+                    subband_size=8, subband_min_good_frac=0.5,
+                    smooth_order=2, fill_failed="smooth_fit",
+                    subband_fill_method="bogus")
+    import pytest
+    with pytest.raises(ValueError, match="Unknown subband_fill_method"):
+        _subband_svd_with_smooth_fit(H, freqs, freq_mask, cfg)
